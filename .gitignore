@@ -1,0 +1,77 @@
+# CMake / Ninja build directories and generated caches
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+build.ninja
+rules.ninja
+.ninja_deps
+.ninja_log
+CMakeUserPresets.json
+
+# Compiler, linker, firmware, and coverage outputs
+*.o
+*.obj
+*.a
+*.lib
+*.elf
+*.axf
+*.out
+*.hex
+*.bin
+*.map
+*.d
+*.su
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+
+# Local IDE settings and language-server caches
+/.idea/
+/.vscode/
+/.vs/
+.cache/
+.clangd/
+.ccls-cache/
+*.code-workspace
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# Script caches, logs, and temporary editor files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Machine-local environment files
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Keep generated/, user_modifiable/, and .settings/exported-files.json:
+# they contain firmware sources and CubeMX regeneration metadata.
