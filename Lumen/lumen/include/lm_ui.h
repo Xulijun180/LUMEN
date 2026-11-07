@@ -46,6 +46,10 @@ typedef struct {
     bool     (*rtc_get)(void *ctx, lm_datetime_t *dt);   /* optional        */
     bool     (*settings_load)(void *ctx, int32_t *v, int n);     /* optional */
     void     (*settings_save)(void *ctx, const int32_t *v, int n); /* optional */
+    /* optional: send pages (bit p = page p) of fb to the panel. May return
+     * before the transfer ends, so it must copy what it needs. NULL: the
+     * core sends them through u8g2, blocking. */
+    void     (*flush)(void *ctx, const uint8_t *fb, uint8_t pages);
     uint8_t  key_layout;                            /* lm_layout_t, 0 = 4 keys */
 } lm_port_t;
 

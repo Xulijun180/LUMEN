@@ -568,17 +568,24 @@ static void present(lm_ui_t *ui, float level)
         ui->contrast_sent = (uint8_t)c;
     }
     const uint8_t *buf = u8g2_GetBufferPtr(u);
-    bool changed = false;
+    uint8_t dirty = 0;
     for (int p = 0; p < LM_PAGES; p++) {
         uint32_t h = fnv(buf + p * LM_W, LM_W);
         if (ui->force_full || h != ui->page_hash[p]) {
             ui->page_hash[p] = h;
-            u8g2_UpdateDisplayArea(u, 0, (uint8_t)p, LM_W / 8, 1);   /* only dirty pages */
-            changed = true;
+            dirty |= (uint8_t)(1u << p);
+        }
+    }
+    if (dirty) {                                     /* only dirty pages */
+        if (ui->port.flush) {
+            ui->port.flush(ui->port.ctx, buf, dirty);
+        } else {
+            for (int p = 0; p < LM_PAGES; p++)
+                if (dirty & (1u << p)) u8g2_UpdateDisplayArea(u, 0, (uint8_t)p, LM_W / 8, 1);
         }
     }
     ui->force_full = false;
-    ui->still_frames = changed ? 0 : (uint16_t)lm_mini(ui->still_frames + 1, 60000);
+    ui->still_frames = dirty ? 0 : (uint16_t)lm_mini(ui->still_frames + 1, 60000);
 }
 
 void lm_ui_step(lm_ui_t *ui, float dt)
