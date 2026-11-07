@@ -1,53 +1,26 @@
-# file-format: 1.0.0
-cmake_minimum_required(VERSION 3.30)
+# Lumen UI library: core + widgets + fonts + bundled u8g2 (fonts only).
+# Hardware-free: a board supplies an lm_port_t (see core/lm_ui.h) and adds
+# this directory with add_subdirectory(). Examples live under examples/.
+cmake_minimum_required(VERSION 3.20)
 
-set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
-set(CMAKE_C_COMPILER_FORCED TRUE)
-set(CMAKE_CXX_COMPILER_FORCED TRUE)
+file(GLOB LUMEN_U8G2_SRC ${CMAKE_CURRENT_LIST_DIR}/third_party/u8g2/csrc/*.c)
 
-include(cmake/target.cmake)
-include(cmake/${TOOLCHAIN_FILE})
+add_library(lumen_ui STATIC
+  ${LUMEN_U8G2_SRC}
+  fonts/u8g2_fonts_subset.c          # only the 6 fonts Lumen uses (full file is 40 MB)
+  core/lm_anim.c core/lm_math.c core/lm_gfx.c core/lm_input.c
+  core/lm_settings.c core/lm_ui.c core/lm_overlay.c
+  widget/lm_widgets.c widget/lm_menu.c widget/lm_icons.c)
 
-project(LUMEN)
-add_executable(LUMEN)
-include(cmake/files.cmake)
-include(cmake/flags.cmake)
-include(cmake/components.cmake)
+target_include_directories(lumen_ui PUBLIC core widget fonts third_party/u8g2/csrc)
 
-# Lumen UI: portable library (core + apps + u8g2), built with the same CPU flags
-add_subdirectory(Lumen)
-
-# Stubs to be able to add compiler flag overrides, e.g. -Os
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-  # Add additional source files here
-  Lumen/port/lumen_port.c            # board port: SSD1306 on I2C1 + 3 buttons
-)
-
-target_include_directories(${CMAKE_PROJECT_NAME} PUBLIC
-  # Add additional include directories here
-  Lumen/port
-)
-
-target_compile_definitions(${CMAKE_PROJECT_NAME} PUBLIC
-  # Add additional defined symbols here
-)
-
-target_compile_options(${CMAKE_PROJECT_NAME} PUBLIC
-  # Add additional compiler flags here
-)
-
-target_link_options(${CMAKE_PROJECT_NAME} PUBLIC
-  # Add additional linker flags here
-)
-
-target_link_directories(${CMAKE_PROJECT_NAME} PUBLIC
-  # Add additional linker search directories here
-)
-
-target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
-  # Add additional linker libraries here
-)
-
-# Plain signature on purpose: cmake/components.cmake (generated) uses it,
-# and CMake forbids mixing plain and keyword forms on one target.
-target_link_libraries(${CMAKE_PROJECT_NAME} lumen_ui)
+# Same CPU/ABI flags as the firmware (CPU_FLAGS comes from the including
+# project), but optimised even in Debug: the rasteriser is the hot path and
+# is rarely stepped through.
+set(LUMEN_OPT "-O2" CACHE STRING "Optimisation level for the Lumen library")
+target_compile_options(lumen_ui PRIVATE ${CPU_FLAGS} ${LUMEN_OPT} -g -std=gnu11
+  -ffunction-sections -fdata-sections --specs=nano.specs -fsingle-precision-constant -fstack-usage)
+# warnings on for Lumen, off for third-party u8g2
+target_compile_options(lumen_ui PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
+set_source_files_properties(${LUMEN_U8G2_SRC} fonts/u8g2_fonts_subset.c PROPERTIES COMPILE_OPTIONS "-w")
+target_link_libraries(lumen_ui PUBLIC m)
