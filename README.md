@@ -196,4 +196,4 @@ target_link_libraries(your_app lumen_ui)
 ## 鸣谢
 
 - u8g2 库：https://github.com/olikraus/u8g2
-- 目录结构参考：[MiaoUI](https://github.com/JFeng-Z/MiaoUI)
+- [MiaoUI](https://github.com/JFeng-Z/MiaoUI)
