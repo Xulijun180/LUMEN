@@ -188,14 +188,6 @@ target_link_libraries(your_app lumen_ui)
 
         工程要求 CMake 3.30 以上。STM32CubeCLT 1.21 自带的是 3.28，版本不够，可以改用 CLion 自带的或单独安装的 CMake。
 
-    ### 注意：SSD1306 规格书写的 I2C 最高速率是 400 kHz，1 MHz 超出了规格。如果屏幕显示不稳定，把 `lumen_port.c` 里的 `LUMEN_I2C_HZ` 改小。
-
-## 后期规划
-
-- [ ] 支持更多分辨率（目前固定为 128×64）
-- [ ] 在 PC 上编译并跑单元测试和模拟器
-- [ ] 设置项保存到 Flash
-- [ ] 空闲时进入低功耗
 
 ## 问题和建议
 
