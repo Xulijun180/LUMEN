@@ -17,11 +17,6 @@ static const uint8_t BAYER[4][4] = {
     {15,  7, 13,  5},
 };
 
-/* u8g2's ll_hvline callback carries no user context (u8x8.user_ptr only
- * exists with U8X8_WITH_USER_PTR, off by default). One canvas draws at a
- * time, so the active one is tracked here; set whenever text is drawn. */
-static lm_gfx_t *s_active;
-
 /* ---------------------------------------------------------------- pixels */
 static inline void put(uint8_t *buf, int x, int y, lm_mode_t m)
 {
@@ -71,11 +66,11 @@ static void span(lm_gfx_t *g, int x0, int x1, int y)
 
 static inline void plot(lm_gfx_t *g, int x, int y) { span(g, x, x + 1, y); }
 
-/* u8g2 -> Lumen bridge: coordinates arrive clipped to the u8g2 window */
+/* u8g2 -> Lumen bridge: coordinates arrive clipped to the u8g2 window.
+ * The u8g2 instance is the canvas's first member, so it upcasts. */
 static void hook_hvline(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t len, uint8_t dir)
 {
-    lm_gfx_t *g = s_active;
-    if (!g) return;
+    lm_gfx_t *g = (lm_gfx_t *)u8g2;
     lm_mode_t save = g->mode;
     if (u8g2->draw_color == 0) g->mode = LM_CLEAR;       /* solid-font background */
     if (dir == 0) {
@@ -87,17 +82,30 @@ static void hook_hvline(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t 
 }
 
 /* ---------------------------------------------------------------- context */
-void lm_gfx_init(lm_gfx_t *g, u8g2_t *u8g2)
+/* Display-less u8x8 device: it only tells u8g2 the canvas size, so text
+ * clips to LM_W x LM_H. Every other message succeeds and does nothing. */
+static const u8x8_display_info_t CANVAS_INFO = {
+    .tile_width = LM_W / 8, .tile_height = LM_PAGES,
+    .pixel_width = LM_W, .pixel_height = LM_H,
+};
+
+static uint8_t canvas_cb(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
+{
+    (void)arg_int; (void)arg_ptr;
+    if (msg == U8X8_MSG_DISPLAY_SETUP_MEMORY) u8x8_d_helper_display_setup_memory(u8x8, &CANVAS_INFO);
+    return 1;
+}
+
+void lm_gfx_init(lm_gfx_t *g)
 {
     memset(g, 0, sizeof(*g));
-    g->u8g2 = u8g2;
-    u8g2->ll_hvline = hook_hvline;
-    u8g2_SetMaxClipWindow(u8g2);
-    u8g2_SetDrawColor(u8g2, 1);
-    u8g2_SetFontMode(u8g2, 1);          /* transparent glyph background */
-    u8g2_SetFontPosTop(u8g2);
-    lm_gfx_target(g, u8g2_GetBufferPtr(u8g2));
-    s_active = g;
+    u8g2_t *u = &g->u8g2;
+    u8x8_Setup(u8g2_GetU8x8(u), canvas_cb, u8x8_dummy_cb, u8x8_dummy_cb, u8x8_dummy_cb);
+    u8g2_SetupBuffer(u, g->screen, LM_PAGES, hook_hvline, U8G2_R0);
+    u8g2_SetDrawColor(u, 1);
+    u8g2_SetFontMode(u, 1);             /* transparent glyph background */
+    u8g2_SetFontPosTop(u);
+    lm_gfx_target(g, g->screen);
 }
 
 void lm_gfx_target(lm_gfx_t *g, uint8_t *buf)
@@ -108,7 +116,6 @@ void lm_gfx_target(lm_gfx_t *g, uint8_t *buf)
     g->ox = g->oy = 0;
     g->clip.x0 = 0; g->clip.y0 = 0; g->clip.x1 = LM_W; g->clip.y1 = LM_H;
     g->clip_sp = g->off_sp = 0;
-    s_active = g;
 }
 
 void lm_gfx_clear(lm_gfx_t *g) { memset(g->target, 0, LM_FB_BYTES); }
@@ -423,18 +430,17 @@ void lm_dotted_vline(lm_gfx_t *g, float x, float y, float h, int step)
 /* ---------------------------------------------------------------- text */
 void lm_font(lm_gfx_t *g, const uint8_t *font)
 {
-    u8g2_SetFont(g->u8g2, font);
-    u8g2_SetFontPosTop(g->u8g2);
+    u8g2_SetFont(&g->u8g2, font);
+    u8g2_SetFontPosTop(&g->u8g2);
 }
 
 int lm_text(lm_gfx_t *g, float x, float y, const char *s)
 {
     int lx = lm_roundi(x), ly = lm_roundi(y);
     int sx = lx + g->ox, sy = ly + g->oy;
-    s_active = g;
-    u8g2_SetDrawColor(g->u8g2, 1);
+    u8g2_SetDrawColor(&g->u8g2, 1);
     /* 16-bit u8g2 coordinates wrap; its clipper handles "negative" starts */
-    u8g2_uint_t w = u8g2_DrawStr(g->u8g2, (u8g2_uint_t)(int16_t)sx, (u8g2_uint_t)(int16_t)sy, s);
+    u8g2_uint_t w = u8g2_DrawStr(&g->u8g2, (u8g2_uint_t)(int16_t)sx, (u8g2_uint_t)(int16_t)sy, s);
     return lx + (int)w;
 }
 
@@ -445,7 +451,7 @@ int lm_text_w(lm_gfx_t *g, const char *s)
     return w;
 }
 
-int lm_char_w(lm_gfx_t *g, char c) { return u8g2_GetGlyphWidth(g->u8g2, (uint8_t)c); }
+int lm_char_w(lm_gfx_t *g, char c) { return u8g2_GetGlyphWidth(&g->u8g2, (uint8_t)c); }
 
 int lm_text_center(lm_gfx_t *g, float cx, float y, const char *s)
 {
@@ -457,7 +463,7 @@ int lm_text_right(lm_gfx_t *g, float rx, float y, const char *s)
     return lm_text(g, rx - (float)lm_text_w(g, s), y, s);
 }
 
-int lm_font_h(lm_gfx_t *g) { return u8g2_GetAscent(g->u8g2) - u8g2_GetDescent(g->u8g2); }
+int lm_font_h(lm_gfx_t *g) { return u8g2_GetAscent(&g->u8g2) - u8g2_GetDescent(&g->u8g2); }
 
 /* ---------------------------------------------------------------- buffers */
 static uint8_t col_mask(int xmod4, int a16)

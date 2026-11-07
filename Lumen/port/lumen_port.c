@@ -3,6 +3,8 @@
  * three buttons (UP / DOWN / ENTER, active low with pull-ups).
  *
  * Everything board specific lives in this file:
+ *   - panel driver        -> u8x8 (SH1106/SSD1306 command set), owned here; the
+ *                            core only hands over a page-format frame buffer
  *   - frame data          -> LPDMA1 CH0 + I2C1 IRQs, async (see "DMA flush")
  *   - u8x8 byte callback  -> HAL_I2C_MASTER_Transmit on I2C1 (PB8 SCL / PB9 SDA),
  *                            init / contrast / power save only
@@ -67,7 +69,7 @@
 
 lumen_diag_t lumen_diag;           /* inspect in the debugger */
 
-static u8g2_t s_u8g2;
+static u8x8_t s_u8x8;               /* panel driver: init, contrast, power */
 static lm_ui_t s_ui;
 static hal_i2c_handle_t *s_i2c;
 
@@ -194,7 +196,7 @@ static uint8_t i2c_probe(uint32_t budget_ms)
  * 0xB0|page] and a data transfer [0x40, 128 bytes], x = the driver's column
  * offset (0 SSD1306, 2 SH1106). Just in 2 transfers per page instead of 7.
  *
- * Blocking u8g2 commands (contrast, power save) still use byte_cb(), which
+ * Blocking u8x8 commands (contrast, power save) still use byte_cb(), which
  * waits for the chain to finish first, and the I2C1 interrupts are only
  * enabled while a chain runs so the HAL never sees them. */
 #define OLED_DMA_CH LPDMA1_CH0
@@ -241,7 +243,7 @@ static void fl_start_step(void)
     ch->CSAR = (uint32_t)src;
     ch->CDAR = (uint32_t)&I2C1->TXDR;
     ch->CCR = DMA_CCR_EN;
-    I2C1->CR2 = ((uint32_t)u8x8_GetI2CAddress(u8g2_GetU8x8(&s_u8g2)) << I2C_CR2_SADD_Pos) |
+    I2C1->CR2 = ((uint32_t)u8x8_GetI2CAddress(&s_u8x8) << I2C_CR2_SADD_Pos) |
                 (n << I2C_CR2_NBYTES_Pos) | I2C_CR2_AUTOEND | I2C_CR2_START;
 }
 
@@ -318,7 +320,7 @@ static void port_flush(void *ctx, const uint8_t *fb, uint8_t pages)
     oled_wait_idle();                     /* previous frame still on the bus */
     pages |= s_fl.failed;
     s_fl.failed = 0;
-    uint8_t x = u8g2_GetU8x8(&s_u8g2)->x_offset;
+    uint8_t x = s_u8x8.x_offset;
     uint8_t n = 0;
     for (uint8_t p = 0; p < LM_PAGES; p++) {
         if (!(pages & (1u << p))) continue;
@@ -389,7 +391,7 @@ static uint8_t byte_cb(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr
     return 1;
 }
 
-/* True while u8g2_InitDisplay() runs. The SSD1306 init sequence itself has
+/* True while u8x8_InitDisplay() runs. The SSD1306 init sequence itself has
  * no delays; the only ones u8g2 issues there are for pulsing a RESET pin
  * (100 + 100 + 100 ms). I2C modules have no such pin, so they are skipped. */
 static bool s_skip_reset_delays;
@@ -420,6 +422,20 @@ static uint8_t port_keys(void *ctx)
     return m;
 }
 
+#if !LUMEN_OLED_DMA
+/* blocking fallback: u8g2's own transfers, 7 per page */
+static void port_flush_blocking(void *ctx, const uint8_t *fb, uint8_t pages)
+{
+    (void)ctx;
+    for (uint8_t p = 0; p < LM_PAGES; p++)
+        if (pages & (1u << p)) u8x8_DrawTile(&s_u8x8, 0, p, LM_W / 8, (uint8_t *)fb + p * LM_W);
+}
+#endif
+
+/* both block: byte_cb() waits for a running DMA flush first */
+static void port_contrast(void *ctx, uint8_t level) { (void)ctx; u8x8_SetContrast(&s_u8x8, level); }
+static void port_power(void *ctx, bool on) { (void)ctx; u8x8_SetPowerSave(&s_u8x8, on ? 0 : 1); }
+
 /* TODO(settings): persist to the last Flash page. The UI already debounces
  * writes to >= 1 s after the last change, so wear stays low. */
 static bool port_load(void *ctx, int32_t *v, int n) { (void)ctx; (void)v; (void)n; return false; }
@@ -449,10 +465,10 @@ void lumen_run(void)
     if (!lumen_diag.addr) lumen_diag.addr = 0x3C;   /* still run the UI; diag shows the failure */
 
     lumen_diag.stage = LUMEN_STAGE_DISPLAY;
-    u8g2_Setup_sh1106_i2c_128x64_noname_f(&s_u8g2, U8G2_R0, byte_cb, gpio_cb);
-    u8g2_SetI2CAddress(&s_u8g2, (uint8_t)(lumen_diag.addr << 1));
+    u8x8_Setup(&s_u8x8, u8x8_d_sh1106_128x64_noname, u8x8_cad_ssd13xx_fast_i2c, byte_cb, gpio_cb);
+    u8x8_SetI2CAddress(&s_u8x8, (uint8_t)(lumen_diag.addr << 1));
     s_skip_reset_delays = true;
-    u8g2_InitDisplay(&s_u8g2);
+    u8x8_InitDisplay(&s_u8x8);
     s_skip_reset_delays = false;
     lumen_diag.t_display_ms = HAL_GetTick();
     lumen_log("[lumen] ssd1306 init done t=%lu ms  i2c %lu ok / %lu failed\r\n",
@@ -460,14 +476,17 @@ void lumen_run(void)
          (unsigned long)lumen_diag.i2c_errors);
 
     lm_port_t port = {0};
-    port.u8g2 = &s_u8g2;
     port.millis = port_millis;
     port.read_keys = port_keys;
     port.settings_load = port_load;
     port.settings_save = port_save;
+    port.set_contrast = port_contrast;
+    port.set_power = port_power;
 #if LUMEN_OLED_DMA
     oled_dma_init();
     port.flush = port_flush;
+#else
+    port.flush = port_flush_blocking;
 #endif
     port.key_layout = LM_LAYOUT_3KEY;
     lm_ui_init(&s_ui, &port, app_defaults, S_COUNT);

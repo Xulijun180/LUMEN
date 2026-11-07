@@ -12,13 +12,18 @@
 
 static void settings_changed(void *ctx, int id, int32_t old_v, int32_t new_v);
 
+static void panel_power(lm_ui_t *ui, bool on)
+{
+    if (ui->port.set_power) ui->port.set_power(ui->port.ctx, on);
+}
+
 /* ======================================================================= init */
 void lm_ui_init(lm_ui_t *ui, const lm_port_t *port, const int32_t *defaults, int ndefaults)
 {
     memset(ui, 0, sizeof(*ui));
     ui->port = *port;
     ui->keys.layout = port->key_layout;
-    lm_gfx_init(&ui->gfx, port->u8g2);
+    lm_gfx_init(&ui->gfx);
     lm_settings_init(&ui->settings, defaults, ndefaults);
     if (port->settings_load) {
         int32_t v[LM_MAX_SETTINGS];
@@ -39,7 +44,7 @@ void lm_ui_init(lm_ui_t *ui, const lm_port_t *port, const int32_t *defaults, int
     ui->haptic_t = -9.f;
     ui->clock_base.year = 2025; ui->clock_base.month = 6; ui->clock_base.day = 18;
     ui->clock_base.wday = 2; ui->clock_base.hour = 12; ui->clock_base.min = 59;
-    u8g2_SetPowerSave(port->u8g2, 1);
+    panel_power(ui, false);
 }
 
 void lm_ui_start(lm_ui_t *ui, lm_page_t *root)
@@ -70,7 +75,7 @@ void lm_wake(lm_ui_t *ui)
         ui->power = LM_PWR_TURNING_ON;
         lm_tween_start(&ui->power_tw, 1, 0, 0.6f, LM_CURVE_LINEAR, 0);
         ui->idle = 0;
-        u8g2_SetPowerSave(ui->port.u8g2, 0);
+        panel_power(ui, true);
         ui->force_full = true;
     }
 }
@@ -356,7 +361,7 @@ static void update(lm_ui_t *ui, float dt)
     lm_tween_update(&ui->power_tw, dt);
     if (ui->power == LM_PWR_TURNING_OFF && lm_tween_done(&ui->power_tw)) {
         ui->power = LM_PWR_OFF;
-        u8g2_SetPowerSave(ui->port.u8g2, 1);
+        panel_power(ui, false);
     } else if (ui->power == LM_PWR_TURNING_ON && lm_tween_done(&ui->power_tw)) {
         ui->power = LM_PWR_ON;
     }
@@ -561,13 +566,12 @@ static void render(lm_ui_t *ui)
 
 static void present(lm_ui_t *ui, float level)
 {
-    u8g2_t *u = ui->port.u8g2;
     int c = lm_roundi(lm_clamp01(level) * 255.f);
     if (c != ui->contrast_sent) {
-        u8g2_SetContrast(u, (uint8_t)c);
+        if (ui->port.set_contrast) ui->port.set_contrast(ui->port.ctx, (uint8_t)c);
         ui->contrast_sent = (uint8_t)c;
     }
-    const uint8_t *buf = u8g2_GetBufferPtr(u);
+    const uint8_t *buf = lm_gfx_screen(&ui->gfx);
     uint8_t dirty = 0;
     for (int p = 0; p < LM_PAGES; p++) {
         uint32_t h = fnv(buf + p * LM_W, LM_W);
@@ -576,14 +580,7 @@ static void present(lm_ui_t *ui, float level)
             dirty |= (uint8_t)(1u << p);
         }
     }
-    if (dirty) {                                     /* only dirty pages */
-        if (ui->port.flush) {
-            ui->port.flush(ui->port.ctx, buf, dirty);
-        } else {
-            for (int p = 0; p < LM_PAGES; p++)
-                if (dirty & (1u << p)) u8g2_UpdateDisplayArea(u, 0, (uint8_t)p, LM_W / 8, 1);
-        }
-    }
+    if (dirty && ui->port.flush) ui->port.flush(ui->port.ctx, buf, dirty);   /* only dirty pages */
     ui->force_full = false;
     ui->still_frames = dirty ? 0 : (uint16_t)lm_mini(ui->still_frames + 1, 60000);
 }
