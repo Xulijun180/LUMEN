@@ -25,8 +25,9 @@ typedef struct {
     volatile uint32_t t_run_ms;      /* HAL_GetTick() when lumen_run() started        */
     volatile uint32_t t_display_ms;  /* ... after the SSD1306 init sequence           */
     volatile uint32_t t_first_frame_ms; /* ... after the first UI frame was sent      */
-    volatile uint32_t frame_ms;      /* duration of the last frame (render + I2C)     */
+    volatile uint32_t frame_ms;      /* duration of the last frame (render + wait for previous DMA flush) */
     volatile uint32_t frame_ms_max;  /* worst frame so far                            */
+    volatile uint32_t flush_ms;      /* last DMA flush, start to last STOP            */
     volatile uint8_t  sda_stuck;     /* SDA was held low at boot (recovered)          */
     volatile uint8_t  scl_stuck;     /* SCL held low: wiring / pull-up problem        */
     volatile uint32_t probe_ms;      /* time until the panel ACKed                    */

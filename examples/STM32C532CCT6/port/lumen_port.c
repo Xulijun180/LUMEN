@@ -3,7 +3,11 @@
  * three buttons (UP / DOWN / ENTER, active low with pull-ups).
  *
  * Everything board specific lives in this file:
- *   - u8x8 byte callback  -> HAL_I2C_MASTER_Transmit on I2C1 (PB8 SCL / PB9 SDA)
+ *   - panel driver        -> u8x8 (SH1106/SSD1306 command set), owned here; the
+ *                            core only hands over a page-format frame buffer
+ *   - frame data          -> LPDMA1 CH0 + I2C1 IRQs, async (see "DMA flush")
+ *   - u8x8 byte callback  -> HAL_I2C_MASTER_Transmit on I2C1 (PB8 SCL / PB9 SDA),
+ *                            init / contrast / power save only
  *   - u8x8 gpio callback  -> delays only (I2C modules have no RST/DC/CS)
  *   - lm_port_t           -> HAL_GetTick, button pins, (settings storage stub)
  *
@@ -53,10 +57,19 @@
 #ifndef LUMEN_FRAME_MS
 #define LUMEN_FRAME_MS 10          /* frame period cap (ms) */
 #endif
+/* 1: frames go out by LPDMA1 CH0 + I2C1 interrupts while the next one renders.
+ * 0: blocking u8g2 path (useful to A/B the two on a suspicious panel). */
+#ifndef LUMEN_OLED_DMA
+#define LUMEN_OLED_DMA 1
+#endif
+/* a whole frame is ~1.1 KB, ~110 ms even at 100 kHz: beyond this the bus is stuck */
+#ifndef LUMEN_FLUSH_TIMEOUT_MS
+#define LUMEN_FLUSH_TIMEOUT_MS 150
+#endif
 
 lumen_diag_t lumen_diag;           /* inspect in the debugger */
 
-static u8g2_t s_u8g2;
+static u8x8_t s_u8x8;               /* panel driver: init, contrast, power */
 static lm_ui_t s_ui;
 static hal_i2c_handle_t *s_i2c;
 
@@ -169,6 +182,179 @@ static uint8_t i2c_probe(uint32_t budget_ms)
     return 0;
 }
 
+/* ================================================================ DMA flush */
+/* Frame data goes out without the CPU: LPDMA1 CH0 feeds I2C1->TXDR and the
+ * I2C1 STOP interrupt starts the next transfer, so the next frame renders
+ * while this one is on the bus. Register level on purpose: HAL I2C DMA is
+ * off in the CubeMX project (USE_HAL_I2C_DMA 0), and generated/ is
+ * overwritten on regeneration. Nothing else in the project uses LPDMA1 or
+ * the I2C1 IRQs; if CubeMX ever enables them, the handlers below clash at
+ * link time instead of misbehaving.
+ *
+ * Bytes on the wire are the ones u8g2 sends for this driver (ssd1306/sh1106
+ * DRAW_TILE): per page, a command transfer [0x00, 0x40, 0x10|x>>4, x&15,
+ * 0xB0|page] and a data transfer [0x40, 128 bytes], x = the driver's column
+ * offset (0 SSD1306, 2 SH1106). Just in 2 transfers per page instead of 7.
+ *
+ * Blocking u8x8 commands (contrast, power save) still use byte_cb(), which
+ * waits for the chain to finish first, and the I2C1 interrupts are only
+ * enabled while a chain runs so the HAL never sees them. */
+#define OLED_DMA_CH LPDMA1_CH0
+
+typedef struct {
+    uint8_t cmd[5];
+    uint8_t data[1 + LM_W];
+    uint8_t page;
+} oled_pkt_t;
+
+static oled_pkt_t s_pkt[LM_PAGES];
+static struct {
+    volatile bool busy;
+    volatile uint8_t step, steps;        /* 2 transfers per queued page */
+    volatile uint8_t failed;             /* pages to resend next flush */
+    volatile bool nack;
+    uint32_t t0;
+} s_fl;
+
+static void dma_stop(void)
+{
+    DMA_Channel_TypeDef *ch = OLED_DMA_CH;
+    if (ch->CCR & DMA_CCR_EN) {
+        ch->CCR |= DMA_CCR_SUSP;
+        for (uint32_t i = 0; i < 10000u && !(ch->CSR & DMA_CSR_SUSPF); i++) {}
+    }
+    ch->CCR = DMA_CCR_RESET;
+    ch->CFCR = DMA_CFCR_TCF | DMA_CFCR_HTF | DMA_CFCR_DTEF | DMA_CFCR_ULEF |
+               DMA_CFCR_USEF | DMA_CFCR_SUSPF | DMA_CFCR_TOF;
+}
+
+/* start transfer s_fl.step: DMA first, then START (TXIS requests the bytes) */
+static void fl_start_step(void)
+{
+    const oled_pkt_t *k = &s_pkt[s_fl.step >> 1];
+    const uint8_t *src = (s_fl.step & 1) ? k->data : k->cmd;
+    uint32_t n = (s_fl.step & 1) ? sizeof(k->data) : sizeof(k->cmd);
+    DMA_Channel_TypeDef *ch = OLED_DMA_CH;
+    ch->CTR1 = DMA_CTR1_SINC;                         /* bytes, memory++ -> fixed TXDR */
+    ch->CTR2 = (uint32_t)LL_LPDMA1_REQUEST_I2C1_TX << DMA_CTR2_REQSEL_Pos;
+    ch->CLLR = 0;
+    ch->CFCR = DMA_CFCR_TCF;                          /* from the previous transfer */
+    ch->CBR1 = n;
+    ch->CSAR = (uint32_t)src;
+    ch->CDAR = (uint32_t)&I2C1->TXDR;
+    ch->CCR = DMA_CCR_EN;
+    I2C1->CR2 = ((uint32_t)u8x8_GetI2CAddress(&s_u8x8) << I2C_CR2_SADD_Pos) |
+                (n << I2C_CR2_NBYTES_Pos) | I2C_CR2_AUTOEND | I2C_CR2_START;
+}
+
+static void fl_finish(void)
+{
+    I2C1->CR1 &= ~(I2C_CR1_TXDMAEN | I2C_CR1_STOPIE | I2C_CR1_NACKIE | I2C_CR1_ERRIE);
+    dma_stop();
+    for (uint8_t s = s_fl.step >> 1; s < s_fl.steps >> 1; s++)
+        s_fl.failed |= (uint8_t)(1u << s_pkt[s].page);           /* never sent */
+    lumen_diag.flush_ms = HAL_GetTick() - s_fl.t0;
+    s_fl.busy = false;
+}
+
+void I2C1_EV_IRQHandler(void)
+{
+    uint32_t isr = I2C1->ISR;
+    if (isr & I2C_ISR_NACKF) {            /* panel gone: hardware sends STOP itself */
+        I2C1->ICR = I2C_ICR_NACKCF;
+        s_fl.nack = true;
+        dma_stop();
+        I2C1->ISR = I2C_ISR_TXE;          /* flush a byte DMA already wrote */
+    }
+    if (!(isr & I2C_ISR_STOPF)) return;
+    I2C1->ICR = I2C_ICR_STOPCF;
+    if (s_fl.nack) {
+        lumen_diag.i2c_errors++;
+        s_fl.nack = false;
+        s_fl.failed |= (uint8_t)(1u << s_pkt[s_fl.step >> 1].page);
+        s_fl.step = (uint8_t)((s_fl.step | 1u) + 1u);            /* skip the rest of this page */
+    } else {
+        lumen_diag.i2c_ok++;
+        s_fl.step++;
+    }
+    if (s_fl.step < s_fl.steps) fl_start_step();
+    else fl_finish();
+}
+
+void I2C1_ERR_IRQHandler(void)            /* bus error / arbitration lost / overrun */
+{
+    I2C1->ICR = I2C_ICR_BERRCF | I2C_ICR_ARLOCF | I2C_ICR_OVRCF | I2C_ICR_NACKCF | I2C_ICR_STOPCF;
+    lumen_diag.i2c_errors++;
+    fl_finish();
+    I2C1->CR1 &= ~I2C_CR1_PE;             /* software reset: release the bus */
+    for (volatile int i = 0; i < 16; i++) {}
+    I2C1->CR1 |= I2C_CR1_PE;
+}
+
+/* Wait for the running chain. A bus that stops answering mid-transfer (no
+ * STOP, no NACK) is abandoned after LUMEN_FLUSH_TIMEOUT_MS, so the UI keeps
+ * running on a loose cable. */
+static void oled_wait_idle(void)
+{
+    while (s_fl.busy) {
+        if (HAL_GetTick() - s_fl.t0 > LUMEN_FLUSH_TIMEOUT_MS) {
+            NVIC_DisableIRQ(I2C1_EV_IRQn);
+            NVIC_DisableIRQ(I2C1_ERR_IRQn);
+            if (s_fl.busy) {
+                lumen_diag.i2c_errors++;
+                fl_finish();
+                I2C1->CR1 &= ~I2C_CR1_PE;
+                for (volatile int i = 0; i < 16; i++) {}
+                I2C1->CR1 |= I2C_CR1_PE;
+            }
+            NVIC_EnableIRQ(I2C1_EV_IRQn);
+            NVIC_EnableIRQ(I2C1_ERR_IRQn);
+        }
+    }
+}
+
+/* lm_port_t.flush: copy the dirty pages, start the chain, return */
+static void port_flush(void *ctx, const uint8_t *fb, uint8_t pages)
+{
+    (void)ctx;
+    oled_wait_idle();                     /* previous frame still on the bus */
+    pages |= s_fl.failed;
+    s_fl.failed = 0;
+    uint8_t x = s_u8x8.x_offset;
+    uint8_t n = 0;
+    for (uint8_t p = 0; p < LM_PAGES; p++) {
+        if (!(pages & (1u << p))) continue;
+        oled_pkt_t *k = &s_pkt[n++];
+        k->page = p;
+        k->cmd[0] = 0x00;                 /* control byte: commands follow */
+        k->cmd[1] = 0x40;                 /* display start line 0 */
+        k->cmd[2] = (uint8_t)(0x10 | (x >> 4));
+        k->cmd[3] = (uint8_t)(x & 15);
+        k->cmd[4] = (uint8_t)(0xB0 | p);
+        k->data[0] = 0x40;                /* control byte: data follow */
+        memcpy(&k->data[1], fb + p * LM_W, LM_W);
+    }
+    if (!n) return;
+    s_fl.step = 0;
+    s_fl.steps = (uint8_t)(2 * n);
+    s_fl.nack = false;
+    s_fl.t0 = HAL_GetTick();
+    s_fl.busy = true;
+    I2C1->ICR = I2C_ICR_STOPCF | I2C_ICR_NACKCF | I2C_ICR_BERRCF | I2C_ICR_ARLOCF | I2C_ICR_OVRCF;
+    I2C1->CR1 |= I2C_CR1_TXDMAEN | I2C_CR1_STOPIE | I2C_CR1_NACKIE | I2C_CR1_ERRIE;
+    fl_start_step();
+}
+
+static void oled_dma_init(void)
+{
+    HAL_RCC_LPDMA1_EnableClock();
+    dma_stop();
+    NVIC_SetPriority(I2C1_EV_IRQn, 8);    /* handlers are a few us; SysTick is 15 */
+    NVIC_SetPriority(I2C1_ERR_IRQn, 8);
+    NVIC_EnableIRQ(I2C1_EV_IRQn);
+    NVIC_EnableIRQ(I2C1_ERR_IRQn);
+}
+
 /* ================================================================ u8x8 transport */
 /* u8g2's SSD13xx I2C layer sends at most 1 control byte + 24 data bytes per
  * transfer; buffer the bytes between START/END and send them in one go. */
@@ -191,6 +377,7 @@ static uint8_t byte_cb(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr
         break;
     }
     case U8X8_MSG_BYTE_END_TRANSFER:
+        oled_wait_idle();                    /* never interleave with a DMA flush */
         if (HAL_I2C_MASTER_Transmit(s_i2c, u8x8_GetI2CAddress(u8x8), buf, n, LUMEN_I2C_TIMEOUT_MS) == HAL_OK)
             lumen_diag.i2c_ok++;
         else
@@ -204,7 +391,7 @@ static uint8_t byte_cb(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr
     return 1;
 }
 
-/* True while u8g2_InitDisplay() runs. The SSD1306 init sequence itself has
+/* True while u8x8_InitDisplay() runs. The SSD1306 init sequence itself has
  * no delays; the only ones u8g2 issues there are for pulsing a RESET pin
  * (100 + 100 + 100 ms). I2C modules have no such pin, so they are skipped. */
 static bool s_skip_reset_delays;
@@ -235,6 +422,20 @@ static uint8_t port_keys(void *ctx)
     return m;
 }
 
+#if !LUMEN_OLED_DMA
+/* blocking fallback: u8g2's own transfers, 7 per page */
+static void port_flush_blocking(void *ctx, const uint8_t *fb, uint8_t pages)
+{
+    (void)ctx;
+    for (uint8_t p = 0; p < LM_PAGES; p++)
+        if (pages & (1u << p)) u8x8_DrawTile(&s_u8x8, 0, p, LM_W / 8, (uint8_t *)fb + p * LM_W);
+}
+#endif
+
+/* both block: byte_cb() waits for a running DMA flush first */
+static void port_contrast(void *ctx, uint8_t level) { (void)ctx; u8x8_SetContrast(&s_u8x8, level); }
+static void port_power(void *ctx, bool on) { (void)ctx; u8x8_SetPowerSave(&s_u8x8, on ? 0 : 1); }
+
 /* TODO(settings): persist to the last Flash page. The UI already debounces
  * writes to >= 1 s after the last change, so wear stays low. */
 static bool port_load(void *ctx, int32_t *v, int n) { (void)ctx; (void)v; (void)n; return false; }
@@ -264,10 +465,10 @@ void lumen_run(void)
     if (!lumen_diag.addr) lumen_diag.addr = 0x3C;   /* still run the UI; diag shows the failure */
 
     lumen_diag.stage = LUMEN_STAGE_DISPLAY;
-    u8g2_Setup_sh1106_i2c_128x64_noname_f(&s_u8g2, U8G2_R0, byte_cb, gpio_cb);
-    u8g2_SetI2CAddress(&s_u8g2, (uint8_t)(lumen_diag.addr << 1));
+    u8x8_Setup(&s_u8x8, u8x8_d_sh1106_128x64_noname, u8x8_cad_ssd13xx_fast_i2c, byte_cb, gpio_cb);
+    u8x8_SetI2CAddress(&s_u8x8, (uint8_t)(lumen_diag.addr << 1));
     s_skip_reset_delays = true;
-    u8g2_InitDisplay(&s_u8g2);
+    u8x8_InitDisplay(&s_u8x8);
     s_skip_reset_delays = false;
     lumen_diag.t_display_ms = HAL_GetTick();
     lumen_log("[lumen] ssd1306 init done t=%lu ms  i2c %lu ok / %lu failed\r\n",
@@ -275,11 +476,18 @@ void lumen_run(void)
          (unsigned long)lumen_diag.i2c_errors);
 
     lm_port_t port = {0};
-    port.u8g2 = &s_u8g2;
     port.millis = port_millis;
     port.read_keys = port_keys;
     port.settings_load = port_load;
     port.settings_save = port_save;
+    port.set_contrast = port_contrast;
+    port.set_power = port_power;
+#if LUMEN_OLED_DMA
+    oled_dma_init();
+    port.flush = port_flush;
+#else
+    port.flush = port_flush_blocking;
+#endif
     port.key_layout = LM_LAYOUT_3KEY;
     lm_ui_init(&s_ui, &port, app_defaults, S_COUNT);
     app_start(&s_ui);
@@ -299,8 +507,9 @@ void lumen_run(void)
                  (unsigned long)lumen_diag.i2c_ok, (unsigned long)lumen_diag.i2c_errors);
         } else if (n == 200) {                       /* boot animation is over by now */
             uint32_t span = HAL_GetTick() - lumen_diag.t_first_frame_ms;
-            lumen_log("[lumen] 200 frames in %lu ms (avg %lu ms, worst %lu ms)  i2c %lu ok / %lu failed\r\n",
+            lumen_log("[lumen] 200 frames in %lu ms (avg %lu ms, worst %lu ms, last flush %lu ms)  i2c %lu ok / %lu failed\r\n",
                  (unsigned long)span, (unsigned long)(span / 199u), (unsigned long)lumen_diag.frame_ms_max,
+                 (unsigned long)lumen_diag.flush_ms,
                  (unsigned long)lumen_diag.i2c_ok, (unsigned long)lumen_diag.i2c_errors);
         }
         while (HAL_GetTick() - t0 < LUMEN_FRAME_MS) {}   /* frame cap */

@@ -3,8 +3,10 @@
  *
  * Architecture
  *   - Hardware is injected through lm_port_t (dependency inversion): the core
- *     never includes a platform header. A port supplies a u8g2 instance that
- *     is already set up, plus time / keys / optional haptics, RTC, storage.
+ *     never includes a platform header or talks to a panel driver. A port
+ *     supplies flush / contrast / power for the panel, plus time / keys /
+ *     optional haptics, RTC, storage. u8g2 is used inside the core for
+ *     fonts only (see lm_gfx.h).
  *   - Pages and overlays are objects with a const ops table (a vtable in
  *     flash). Concrete types embed lm_page_t / lm_overlay_t as the first
  *     member, so they are upcast by address. Every op is optional.
@@ -39,13 +41,19 @@ typedef struct {
 
 typedef struct {
     void *ctx;
-    u8g2_t *u8g2;                                   /* set up by the port   */
     uint32_t (*millis)(void *ctx);                  /* monotonic ms         */
     uint8_t  (*read_keys)(void *ctx);               /* LM_KEYBIT mask, NULL if the port pushes events */
     void     (*haptic)(void *ctx, uint16_t ms);     /* optional             */
     bool     (*rtc_get)(void *ctx, lm_datetime_t *dt);   /* optional        */
     bool     (*settings_load)(void *ctx, int32_t *v, int n);     /* optional */
     void     (*settings_save)(void *ctx, const int32_t *v, int n); /* optional */
+    /* ---- display: the port owns the panel driver and its transport ---- */
+    /* send pages (bit p = page p) of fb (LM_FB_BYTES, page format) to the
+     * panel. May return before the transfer ends, so it must copy what it
+     * needs; fb is overwritten by the next frame. NULL: nothing is shown. */
+    void     (*flush)(void *ctx, const uint8_t *fb, uint8_t pages);
+    void     (*set_contrast)(void *ctx, uint8_t level);  /* optional, 0..255 */
+    void     (*set_power)(void *ctx, bool on);           /* optional, panel on/off */
     uint8_t  key_layout;                            /* lm_layout_t, 0 = 4 keys */
 } lm_port_t;
 

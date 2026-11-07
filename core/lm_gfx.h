@@ -1,19 +1,20 @@
 /*
- * Canvas on top of u8g2.
+ * Canvas. The canvas owns the screen buffer; u8g2 is used only for fonts.
  *
- * u8g2 owns fonts, the display driver and the transport. Lumen adds what an
- * animated UI needs and u8g2 lacks: float (sub-pixel) geometry, a clip and
- * translation stack, SET/CLEAR/XOR modes, ordered-dither alpha, and buffer
- * compositing for transitions.
+ * Lumen adds what an animated UI needs and u8g2 lacks: float (sub-pixel)
+ * geometry, a clip and translation stack, SET/CLEAR/XOR modes,
+ * ordered-dither alpha, and buffer compositing for transitions.
  *
- * Integration point: u8g2's ll_hvline callback is replaced, so text and
- * every u8g2 primitive also go through Lumen's mode/dither/target logic.
+ * Integration point: the canvas embeds a private u8g2 instance on a
+ * display-less device whose ll_hvline is Lumen's, so text goes through
+ * Lumen's mode/dither/target logic. The panel driver and its transport
+ * belong to the port (lm_port_t.flush), not to this u8g2.
  * All drawing lands in `target`, which can be the screen buffer or a
  * scratch buffer (pages are rendered off-screen during transitions).
  *
  * Buffers use the SSD1306 page layout: byte = 8 vertical pixels, LSB on top,
- * index = page * 128 + x. Only U8G2_R0 is supported; mount a flipped panel
- * with u8g2_SetFlipMode().
+ * index = page * 128 + x. Mount a flipped panel in the port (e.g.
+ * u8x8_SetFlipMode()).
  */
 #ifndef LM_GFX_H
 #define LM_GFX_H
@@ -32,7 +33,8 @@ typedef struct { int16_t x0, y0, x1, y1; } lm_clip_t;   /* x1/y1 exclusive */
 #define LM_GFX_OFF_DEPTH  8
 
 typedef struct lm_gfx {
-    u8g2_t  *u8g2;
+    u8g2_t   u8g2;                /* first member: the hvline hook upcasts */
+    uint8_t  screen[LM_FB_BYTES]; /* what the port flushes to the panel    */
     uint8_t *target;              /* LM_FB_BYTES buffer being drawn into  */
     lm_mode_t mode;
     uint8_t  alpha;               /* 0..16 ordered-dither coverage         */
@@ -45,7 +47,7 @@ typedef struct lm_gfx {
 } lm_gfx_t;
 
 /* ---- context ----------------------------------------------------------- */
-void lm_gfx_init(lm_gfx_t *g, u8g2_t *u8g2);
+void lm_gfx_init(lm_gfx_t *g);
 void lm_gfx_target(lm_gfx_t *g, uint8_t *buf);           /* also resets clip/offset */
 void lm_gfx_clear(lm_gfx_t *g);
 static inline void lm_gfx_mode(lm_gfx_t *g, lm_mode_t m) { g->mode = m; }
@@ -108,6 +110,6 @@ static inline void lm_buf_blit_scaled(uint8_t *dst, const uint8_t *src,
     lm_buf_blit_region(dst, src, 0, 0, LM_W, LM_H, x, y, w, h, 0, alpha, false);
 }
 
-static inline uint8_t *lm_gfx_screen(lm_gfx_t *g) { return u8g2_GetBufferPtr(g->u8g2); }
+static inline uint8_t *lm_gfx_screen(lm_gfx_t *g) { return g->screen; }
 
 #endif
